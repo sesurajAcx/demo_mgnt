@@ -1,0 +1,158 @@
+name: Capability Sweep
+
+# Runs the pm-capability-sweep skill (headless Claude Code) against every
+# CAP-*/ folder in the repo on a schedule, then opens a PR with whatever
+# tracker.md / capability.md / project.md rollups it regenerated.
+#
+# Generated content (tracker.md, and the <!-- GENERATED:... --> regions in
+# capability.md / project.md) is never hand-edited per CLAUDE.md rule 3 — this
+# workflow is the scheduled, deliberate batch run that pm-capability-sweep's
+# own doc describes, standing in for a human running it after a batch of
+# unit-level changes settles. It lands as a PR, not a direct commit, so a
+# human still reviews the regenerated rollups before they hit main.
+#
+# Required repo secrets:
+#   ANTHROPIC_API_KEY   — lets `claude -p` run headless.
+#   ARTIFACTS_REPO_TOKEN — a PAT (fine-grained, contents:read is enough) with
+#                          access to the private acxworks/acxworks-artifacts repo.
+#                          The default GITHUB_TOKEN cannot reach a different repo
+#                          in a different org, so this is not optional.
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: capability-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      # .claude/skills, /scripts, /templates, /rules and /hooks are gitignored in this
+      # repo (see CLAUDE.md bootstrap block) — acxworks-artifacts is their source of
+      # truth, so this checkout never has them. Without this step pm-capability-sweep
+      # (and every other skill) would be missing on the runner.
+      - name: Bootstrap skills/scripts/templates/rules/hooks
+        env:
+          ARTIFACTS_REPO_TOKEN: ${{ secrets.ARTIFACTS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add acx-artifacts \
+            "https://x-access-token:${ARTIFACTS_REPO_TOKEN}@github.com/acxworks/acxworks-artifacts.git"
+          for pair in skills:claude-skills scripts:claude-scripts templates:claude-templates \
+                      rules:claude-rules hooks:claude-hooks; do
+            name=${pair%%:*}
+            branch="pm-export/${pair#*:}"
+            git fetch -q acx-artifacts "$branch"
+            rm -rf ".claude/$name"
+            mkdir -p ".claude/$name"
+            git archive FETCH_HEAD | tar -x -C ".claude/$name"
+          done
+          git remote remove acx-artifacts
+
+      - name: Discover capabilities
+        id: discover
+        run: |
+          set -euo pipefail
+          find . -type d -regextype posix-extended \
+            -regex '.*/CAP-[A-Z0-9]+-[0-9]{4}-[a-z0-9-]+' \
+            -not -path './templates/*' \
+            | sed 's|^\./||' | sort > /tmp/capabilities.txt
+          count=$(wc -l < /tmp/capabilities.txt)
+          echo "found $count capability folder(s)"
+          cat /tmp/capabilities.txt
+
+      - name: Sweep each capability
+        id: sweep
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -uo pipefail
+          failures=()
+          while IFS= read -r cap_path; do
+            [ -z "$cap_path" ] && continue
+            cap_id=$(basename "$cap_path" | grep -oE '^CAP-[A-Z0-9]+-[0-9]{4}')
+            echo "::group::Sweeping $cap_id ($cap_path)"
+            claude -p "Run the pm-capability-sweep skill for the capability at path '$cap_path' (ID $cap_id). Follow that skill's procedure exactly: roll up every unit under it, then the capability, then the owning project. Do not touch any other capability." \
+              --dangerously-skip-permissions \
+              --output-format text
+            status=$?
+            if [ $status -ne 0 ]; then
+              echo "::warning::pm-capability-sweep failed for $cap_id (exit $status)"
+              failures+=("$cap_id")
+            fi
+            echo "::endgroup::"
+          done < /tmp/capabilities.txt
+
+          if [ ${#failures[@]} -gt 0 ]; then
+            printf '%s\n' "${failures[@]}" > /tmp/failures.txt
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for changes
+        id: changes
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open PR with rollup updates
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="auto/capability-sweep-$(date -u +%Y%m%d-%H%M%S)"
+          git checkout -b "$branch"
+          git -c user.name="capability-sweep-bot" -c user.email="actions@github.com" \
+            commit -m "chore: scheduled capability sweep rollup"
+          git push origin "$branch"
+
+          {
+            echo "Automated run of \`pm-capability-sweep\` across every capability in the repo."
+            echo ""
+            echo "Regenerates \`tracker.md\` (all levels) and the \`<!-- GENERATED:... -->\` regions of \`capability.md\`/\`project.md\`, per \`pm-state-rollup\`. No hand-authored content changed — review the diff and merge if the rollups look right."
+            if [ "${{ steps.sweep.outputs.failed }}" == "true" ] && [ -f /tmp/failures.txt ]; then
+              echo ""
+              echo "One or more capabilities failed to sweep — see the workflow run log:"
+              sed 's/^/- /' /tmp/failures.txt
+            fi
+          } > /tmp/pr-body.md
+
+          gh pr create \
+            --title "Scheduled capability sweep $(date -u +'%Y-%m-%d %H:%M UTC')" \
+            --body-file /tmp/pr-body.md \
+            --base main \
+            --head "$branch"
+
+      - name: Fail job if any capability sweep errored
+        if: steps.sweep.outputs.failed == 'true'
+        run: |
+          echo "One or more capability sweeps failed — see the 'Sweep each capability' step log."
+          exit 1
