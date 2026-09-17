@@ -52,117 +52,27 @@ jobs:
       # repo (see CLAUDE.md bootstrap block) — acxworks-artifacts is their source of
       # truth, so this checkout never has them. Without this step pm-capability-sweep
       # (and every other skill) would be missing on the runner.
-      # Never echo ARTIFACTS_REPO_TOKEN or ANTHROPIC_API_KEY. GitHub Actions
-      # masks registered secrets in logs anyway (they'd print as ***), but a
-      # deliberate echo is exactly the habit that leaks a credential the one
-      # time masking doesn't cover (job summaries, artifact uploads, a
-      # differently-encoded copy). Diagnose via non-secret signals instead:
-      # HTTP status codes, token metadata headers, repo visibility — never the
-      # token bytes themselves.
-      - name: Preflight - verify ARTIFACTS_REPO_TOKEN can see the artifacts repo
-        env:
-          ARTIFACTS_REPO_TOKEN: ${{ secrets.ARTIFACTS_REPO_TOKEN }}
-        run: |
-          set -uo pipefail
-          if [ -z "${ARTIFACTS_REPO_TOKEN:-}" ]; then
-            echo "::error::ARTIFACTS_REPO_TOKEN secret is empty or unset on this repo."
-            exit 1
-          fi
-          echo "ARTIFACTS_REPO_TOKEN length: ${#ARTIFACTS_REPO_TOKEN} chars"
-          case "$ARTIFACTS_REPO_TOKEN" in
-            github_pat_*) echo "Token looks like a fine-grained PAT." ;;
-            ghp_*)        echo "Token looks like a classic PAT." ;;
-            ghs_*)        echo "Token looks like a GitHub App installation token." ;;
-            *)             echo "Token prefix not recognized (unexpected format)." ;;
-          esac
-
-          echo "-- Checking token identity (/user) --"
-          user_code=$(curl -sS -o /tmp/user_resp.json -w '%{http_code}' \
-            -H "Authorization: Bearer ${ARTIFACTS_REPO_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/user)
-          echo "GET /user -> HTTP $user_code"
-          if [ "$user_code" != "200" ]; then
-            echo "Response headers/body (no secret material) below:"
-            cat /tmp/user_resp.json
-          fi
-
-          echo "-- Checking repo visibility to this token (/repos/acxworks/acxworks-artifacts) --"
-          repo_code=$(curl -sS -o /tmp/repo_resp.json -w '%{http_code}' \
-            -H "Authorization: Bearer ${ARTIFACTS_REPO_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/acxworks/acxworks-artifacts)
-          echo "GET /repos/acxworks/acxworks-artifacts -> HTTP $repo_code"
-          cat /tmp/repo_resp.json
-
-          if [ "$repo_code" == "404" ]; then
-            echo "::error::Token cannot see acxworks/acxworks-artifacts. GitHub returns 404 (not 403) for private repos the token isn't authorized for, to avoid confirming existence. Likely causes: token expired/revoked, fine-grained PAT not scoped to this repo, or the org enforces SSO and this token was never authorized for it (Settings -> Developer settings -> Authorized OAuth/PAT access -> acxworks)."
-            exit 1
-          elif [ "$repo_code" != "200" ]; then
-            echo "::error::Unexpected response ($repo_code) checking repo access. See body above."
-            exit 1
-          fi
-          echo "Token can see the repo via the REST API (Bearer auth). Now checking"
-          echo "the exact auth scheme 'git fetch' actually uses (Basic auth to"
-          echo "github.com's smart-HTTP endpoint, not api.github.com) — the API check"
-          echo "above passing does NOT guarantee this one does; they are different"
-          echo "auth paths and can diverge (org policy restricting git ops for classic"
-          echo "PATs, scope gaps, etc)."
-
-          echo "-- Variant A: Basic auth as git fetch sends it (username 'x-access-token') --"
-          gitA_code=$(curl -sS -o /tmp/gitA_resp.txt -D /tmp/gitA_headers.txt -w '%{http_code}' \
-            -u "x-access-token:${ARTIFACTS_REPO_TOKEN}" \
-            "https://github.com/acxworks/acxworks-artifacts.git/info/refs?service=git-upload-pack")
-          echo "GET info/refs (x-access-token user) -> HTTP $gitA_code"
-          echo "Response headers:"; cat /tmp/gitA_headers.txt
-          echo "Response body (first 10 lines):"; head -10 /tmp/gitA_resp.txt
-
-          echo "-- Variant B: Basic auth with the token itself as username, empty password --"
-          gitB_code=$(curl -sS -o /tmp/gitB_resp.txt -D /tmp/gitB_headers.txt -w '%{http_code}' \
-            -u "${ARTIFACTS_REPO_TOKEN}:" \
-            "https://github.com/acxworks/acxworks-artifacts.git/info/refs?service=git-upload-pack")
-          echo "GET info/refs (token-as-username) -> HTTP $gitB_code"
-          echo "Response headers:"; cat /tmp/gitB_headers.txt
-          echo "Response body (first 10 lines):"; head -10 /tmp/gitB_resp.txt
-
-          if [ "$gitA_code" != "200" ] && [ "$gitB_code" != "200" ]; then
-            echo "::error::Both git smart-HTTP auth variants failed ($gitA_code / $gitB_code) even though the REST API accepted this token. This points at an org-level policy gap (e.g. a classic PAT restriction under acxworks org settings -> Personal access tokens) rather than a wrong/expired token — the token is clearly valid since the API call above succeeded. git fetch in the next step will fail the same way; do not expect it to succeed until this is resolved."
-          elif [ "$gitA_code" == "200" ]; then
-            echo "Variant A works — git fetch (which uses this exact scheme) should succeed."
-          else
-            echo "Variant B works but Variant A (what git fetch actually sends) does not — the next step is still expected to fail."
-          fi
-
       - name: Bootstrap skills/scripts/templates/rules/hooks
         env:
           ARTIFACTS_REPO_TOKEN: ${{ secrets.ARTIFACTS_REPO_TOKEN }}
         run: |
           set -euo pipefail
-          # Not GIT_CURL_VERBOSE: it prints the Authorization header as
-          # base64(x-access-token:TOKEN) verbatim, a different string than the
-          # raw secret, so GitHub's log masking (exact-string match) would not
-          # catch it. GIT_TRACE alone shows request URLs/timing, no auth data.
-          export GIT_TRACE=1
           git remote add acx-artifacts \
             "https://x-access-token:${ARTIFACTS_REPO_TOKEN}@github.com/acxworks/acxworks-artifacts.git"
           for pair in skills:claude-skills scripts:claude-scripts templates:claude-templates \
                       rules:claude-rules hooks:claude-hooks; do
             name=${pair%%:*}
             branch="pm-export/${pair#*:}"
-            echo "::group::Fetching $branch"
             # actions/checkout persists a github.com-wide
             # http.https://github.com/.extraheader carrying this job's own
-            # (repo-scoped) GITHUB_TOKEN. It matches acx-artifacts's URL too and
-            # overrides the credentials embedded there, so a plain 'git fetch'
-            # authenticates as GITHUB_TOKEN (which can't see acxworks-artifacts)
-            # instead of ARTIFACTS_REPO_TOKEN. Clear it for this one invocation
-            # only — the "Open PR" step later still needs it intact to push to
-            # origin, so don't touch the persisted .git/config itself.
-            git -c http.https://github.com/.extraheader= fetch -v acx-artifacts "$branch"
+            # repo-scoped GITHUB_TOKEN, which matches (and overrides) credentials
+            # on any github.com remote URL, including this one. Clear it for
+            # just this fetch — the "Open PR" step later still needs it intact
+            # to push to origin, so the persisted .git/config is left alone.
+            git -c http.https://github.com/.extraheader= fetch -q acx-artifacts "$branch"
             rm -rf ".claude/$name"
             mkdir -p ".claude/$name"
             git archive FETCH_HEAD | tar -x -C ".claude/$name"
-            echo "::endgroup::"
           done
           git remote remove acx-artifacts
 
