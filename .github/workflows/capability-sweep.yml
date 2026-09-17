@@ -102,7 +102,36 @@ jobs:
             echo "::error::Unexpected response ($repo_code) checking repo access. See body above."
             exit 1
           fi
-          echo "Token can see the repo. Proceeding to clone via git."
+          echo "Token can see the repo via the REST API (Bearer auth). Now checking"
+          echo "the exact auth scheme 'git fetch' actually uses (Basic auth to"
+          echo "github.com's smart-HTTP endpoint, not api.github.com) — the API check"
+          echo "above passing does NOT guarantee this one does; they are different"
+          echo "auth paths and can diverge (org policy restricting git ops for classic"
+          echo "PATs, scope gaps, etc)."
+
+          echo "-- Variant A: Basic auth as git fetch sends it (username 'x-access-token') --"
+          gitA_code=$(curl -sS -o /tmp/gitA_resp.txt -D /tmp/gitA_headers.txt -w '%{http_code}' \
+            -u "x-access-token:${ARTIFACTS_REPO_TOKEN}" \
+            "https://github.com/acxworks/acxworks-artifacts.git/info/refs?service=git-upload-pack")
+          echo "GET info/refs (x-access-token user) -> HTTP $gitA_code"
+          echo "Response headers:"; cat /tmp/gitA_headers.txt
+          echo "Response body (first 10 lines):"; head -10 /tmp/gitA_resp.txt
+
+          echo "-- Variant B: Basic auth with the token itself as username, empty password --"
+          gitB_code=$(curl -sS -o /tmp/gitB_resp.txt -D /tmp/gitB_headers.txt -w '%{http_code}' \
+            -u "${ARTIFACTS_REPO_TOKEN}:" \
+            "https://github.com/acxworks/acxworks-artifacts.git/info/refs?service=git-upload-pack")
+          echo "GET info/refs (token-as-username) -> HTTP $gitB_code"
+          echo "Response headers:"; cat /tmp/gitB_headers.txt
+          echo "Response body (first 10 lines):"; head -10 /tmp/gitB_resp.txt
+
+          if [ "$gitA_code" != "200" ] && [ "$gitB_code" != "200" ]; then
+            echo "::error::Both git smart-HTTP auth variants failed ($gitA_code / $gitB_code) even though the REST API accepted this token. This points at an org-level policy gap (e.g. a classic PAT restriction under acxworks org settings -> Personal access tokens) rather than a wrong/expired token — the token is clearly valid since the API call above succeeded. git fetch in the next step will fail the same way; do not expect it to succeed until this is resolved."
+          elif [ "$gitA_code" == "200" ]; then
+            echo "Variant A works — git fetch (which uses this exact scheme) should succeed."
+          else
+            echo "Variant B works but Variant A (what git fetch actually sends) does not — the next step is still expected to fail."
+          fi
 
       - name: Bootstrap skills/scripts/templates/rules/hooks
         env:
