@@ -150,7 +150,15 @@ jobs:
             name=${pair%%:*}
             branch="pm-export/${pair#*:}"
             echo "::group::Fetching $branch"
-            git fetch -v acx-artifacts "$branch"
+            # actions/checkout persists a github.com-wide
+            # http.https://github.com/.extraheader carrying this job's own
+            # (repo-scoped) GITHUB_TOKEN. It matches acx-artifacts's URL too and
+            # overrides the credentials embedded there, so a plain 'git fetch'
+            # authenticates as GITHUB_TOKEN (which can't see acxworks-artifacts)
+            # instead of ARTIFACTS_REPO_TOKEN. Clear it for this one invocation
+            # only — the "Open PR" step later still needs it intact to push to
+            # origin, so don't touch the persisted .git/config itself.
+            git -c http.https://github.com/.extraheader= fetch -v acx-artifacts "$branch"
             rm -rf ".claude/$name"
             mkdir -p ".claude/$name"
             git archive FETCH_HEAD | tar -x -C ".claude/$name"
